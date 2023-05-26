@@ -3,13 +3,8 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Identity.Client;
 
-internal class Program
+class Program
 {
-    //Make sure to replace the placeholder values <YOUR_CLIENT_ID>, <YOUR_CLIENT_SECRET>,
-    //<YOUR_TENANT_ID>, <YOUR_AZURE_DEVOPS_URI>, <YOUR_PAT_TOKEN>,
-    //<YOUR_AZURE_DEVOPS_TEAM_ID>, <YOUR_AZURE_DEVOPS_ITERATION_ID>, <YOUR_TEAMS_GROUP_ID>,
-    //and <YOUR_TEAMS_CHANNEL_ID> with your actual values.
-
     private const string ClientId = "<YOUR_CLIENT_ID>"; // Insert your Azure AD application client ID
     private const string ClientSecret = "<YOUR_CLIENT_SECRET>"; // Insert your Azure AD application client secret
     private const string TenantId = "<YOUR_TENANT_ID>"; // Insert your Azure AD tenant ID
@@ -22,25 +17,34 @@ internal class Program
     private const string TeamsGroupId = "<YOUR_TEAMS_GROUP_ID>"; // Insert the ID of the Microsoft Teams group
     private const string ChannelId = "<YOUR_TEAMS_CHANNEL_ID>"; // Insert the ID of the Microsoft Teams channel
 
-    private static async Task Main(string[] args)
+    static async Task Main(string[] args)
     {
         // Authenticate and get access token for Microsoft Graph API
         var graphAccessToken = await GetAccessToken();
 
         // Get start and end dates of the sprint
-        var sprintStartDate = await GetSprintStartDate();
-        var sprintEndDate = await GetSprintEndDate();
+        DateTime sprintStartDate = await GetSprintStartDate();
+        DateTime sprintEndDate = await GetSprintEndDate();
 
         // Retrieve appointments from the specified Microsoft Teams channel calendar within the sprint range
         var appointments = await GetAppointments(graphAccessToken, sprintStartDate, sprintEndDate);
 
-        // Post appointments to Azure DevOps sprint capacity for each team member
-        await PostAppointmentsToSprintCapacity(appointments);
+        // Create absences for each team member based on their appointments
+        var absences = CreateAbsences(appointments);
 
-        Console.WriteLine("Appointments posted to Azure DevOps sprint capacity successfully.");
+        // Copy capacity from the previous sprint
+        var previousCapacity = await GetSprintCapacity(TeamId, await GetPreviousSprintId());
+
+        // Update the capacity with the absences
+        var updatedCapacity = UpdateCapacityWithAbsences(previousCapacity, absences);
+
+        // Post updated capacity to Azure DevOps sprint capacity for each team member
+        await PostCapacityToSprint(updatedCapacity);
+
+        Console.WriteLine("Capacity posted to Azure DevOps sprint successfully.");
     }
 
-    private static async Task<string> GetAccessToken()
+    static async Task<string> GetAccessToken()
     {
         var clientApp = ConfidentialClientApplicationBuilder.Create(ClientId)
             .WithClientSecret(ClientSecret)
@@ -53,12 +57,12 @@ internal class Program
         return authResult.AccessToken;
     }
 
-    private static async Task<DateTime> GetSprintStartDate()
+    static async Task<DateTime> GetSprintStartDate()
     {
         var httpClient = new HttpClient();
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", PatToken);
 
-        const string requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}?api-version=6.0";
+        var requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}?api-version=6.0";
         var response = await httpClient.GetAsync(requestUrl);
         var responseContent = await response.Content.ReadAsStringAsync();
 
@@ -78,82 +82,140 @@ internal class Program
         }
     }
 
-    private static async Task<DateTime> GetSprintEndDate()
+    static async Task<DateTime> GetSprintEndDate()
     {
         var httpClient = new HttpClient();
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", PatToken);
 
-        const string requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}?api-version=6.0";
+        var requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}?api-version=6.0";
         var response = await httpClient.GetAsync(requestUrl);
         var responseContent = await response.Content.ReadAsStringAsync();
 
-        if (!response.IsSuccessStatusCode)
-            throw new Exception($"Failed to retrieve sprint end date from Azure DevOps. Error: {responseContent}");
-        
-        var options = new JsonSerializerOptions
+        if (response.IsSuccessStatusCode)
         {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        };
+            var options = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            };
 
-        var iteration = JsonSerializer.Deserialize<AzureDevOpsIteration>(responseContent, options);
-        return iteration.Attributes.FinishDate;
-
+            var iteration = JsonSerializer.Deserialize<AzureDevOpsIteration>(responseContent, options);
+            return iteration.Attributes.FinishDate;
+        }
+        else
+        {
+            throw new Exception($"Failed to retrieve sprint end date from Azure DevOps. Error: {responseContent}");
+        }
     }
 
-    private static async Task<List<Appointment>> GetAppointments(string accessToken, DateTime startDate, DateTime endDate)
+    static async Task<List<Appointment>> GetAppointments(string accessToken, DateTime startDate, DateTime endDate)
     {
         var httpClient = new HttpClient();
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-        var startDateTime = startDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
-        var endDateTime = endDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
-        var requestUrl = $"{GraphApiUrl}/groups/{TeamsGroupId}/channels/{ChannelId}/calendarView?startDateTime={startDateTime}&endDateTime={endDateTime}";
+        string startDateTime = startDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
+        string endDateTime = endDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
+        string requestUrl = $"{GraphApiUrl}/groups/{TeamsGroupId}/channels/{ChannelId}/calendarView?startDateTime={startDateTime}&endDateTime={endDateTime}";
 
         var response = await httpClient.GetAsync(requestUrl);
         var responseContent = await response.Content.ReadAsStringAsync();
 
-        if (!response.IsSuccessStatusCode)
-            throw new Exception($"Failed to retrieve appointments from Microsoft Teams channel calendar. Error: {responseContent}");
-        
-        var options = new JsonSerializerOptions
+        if (response.IsSuccessStatusCode)
         {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        };
+            var options = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            };
 
-        var events = JsonSerializer.Deserialize<GraphCalendarEventsResponse>(responseContent, options);
-        return events.Value;
-
+            var events = JsonSerializer.Deserialize<GraphCalendarEventsResponse>(responseContent, options);
+            return events.Value;
+        }
+        else
+        {
+            throw new Exception($"Failed to retrieve appointments from Microsoft Teams channel calendar. Error: {responseContent}");
+        }
     }
 
-    private static async Task PostAppointmentsToSprintCapacity(List<Appointment> appointments)
+    static List<Absence> CreateAbsences(List<Appointment> appointments)
+    {
+        var absences = new List<Absence>();
+
+        foreach (var appointment in appointments)
+        {
+            var absence = new Absence
+            {
+                TeamId = TeamId,
+                IterationId = IterationId,
+                TeamMemberEmail = appointment.Organizer.Email,
+                StartDate = appointment.Start.DateTime,
+                EndDate = appointment.End.DateTime
+            };
+
+            absences.Add(absence);
+        }
+
+        return absences;
+    }
+
+    static async Task<List<SprintCapacity>> GetSprintCapacity(string teamId, string sprintId)
     {
         var httpClient = new HttpClient();
         httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", PatToken);
 
-        var capacityItems = new List<CapacityItem>();
-        foreach (var appointment in appointments)
+        var requestUrl = $"{AzureDevOpsUri}/{teamId}/_apis/work/teamsettings/iterations/{sprintId}/capacities?api-version=6.0";
+
+        var response = await httpClient.GetAsync(requestUrl);
+        var responseContent = await response.Content.ReadAsStringAsync();
+
+        if (response.IsSuccessStatusCode)
         {
-            var capacityItem = new CapacityItem
+            var options = new JsonSerializerOptions
             {
-                TeamId = TeamId,
-                IterationId = IterationId,
-                TeamMemberEmail = appointment.Organizer.EmailAddress,
-                Activities = new List<Activity>
-                {
-                    new () { Name = appointment.Subject, CapacityPerDay = 8 } // Assuming each appointment takes 8 hours
-                }
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
             };
 
-            capacityItems.Add(capacityItem);
+            var capacityResponse = JsonSerializer.Deserialize<AzureDevOpsCapacityResponse>(responseContent, options);
+            return capacityResponse.Capacities;
+        }
+        else
+        {
+            throw new Exception($"Failed to retrieve sprint capacity from Azure DevOps. Error: {responseContent}");
+        }
+    }
+
+    static List<SprintCapacity> UpdateCapacityWithAbsences(List<SprintCapacity> capacity, List<Absence> absences)
+    {
+        var updatedCapacity = new List<SprintCapacity>();
+
+        foreach (var cap in capacity)
+        {
+            var absence = absences.FirstOrDefault(a => a.TeamMemberEmail.Equals(cap.TeamMemberEmail));
+
+            if (absence != null)
+            {
+                cap.Activity = "Absence";
+                cap.CapacityPerDay = 0;
+                cap.StartDate = absence.StartDate.Date;
+                cap.EndDate = absence.EndDate.Date.AddDays(1).AddTicks(-1);
+            }
+
+            updatedCapacity.Add(cap);
         }
 
-        const string requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}/capacities?api-version=6.0";
+        return updatedCapacity;
+    }
+
+    static async Task PostCapacityToSprint(List<SprintCapacity> capacity)
+    {
+        var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", PatToken);
+
+        var requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}/capacities?api-version=6.0";
 
         var options = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase
         };
-        var requestBody = JsonSerializer.Serialize(capacityItems, options);
+        var requestBody = JsonSerializer.Serialize(capacity, options);
         var content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
         var response = await httpClient.PostAsync(requestUrl, content);
@@ -161,48 +223,97 @@ internal class Program
 
         if (!response.IsSuccessStatusCode)
         {
-            throw new Exception($"Failed to post appointments to Azure DevOps sprint capacity. Error: {responseContent}");
+            throw new Exception($"Failed to post capacity to Azure DevOps sprint capacity. Error: {responseContent}");
+        }
+    }
+
+    static async Task<string> GetPreviousSprintId()
+    {
+        var httpClient = new HttpClient();
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", PatToken);
+
+        var requestUrl = $"{AzureDevOpsUri}/{TeamId}/_apis/work/teamsettings/iterations/{IterationId}?api-version=6.0-preview.1";
+        var response = await httpClient.GetAsync(requestUrl);
+        var responseContent = await response.Content.ReadAsStringAsync();
+
+        if (response.IsSuccessStatusCode)
+        {
+            var options = new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            };
+
+            var iteration = JsonSerializer.Deserialize<AzureDevOpsIteration>(responseContent, options);
+            return iteration.Relations.Single().Id;
+        }
+        else
+        {
+            throw new Exception($"Failed to retrieve previous sprint ID from Azure DevOps. Error: {responseContent}");
         }
     }
 }
 
-internal class GraphCalendarEventsResponse
+class GraphCalendarEventsResponse
 {
     public List<Appointment> Value { get; set; }
 }
 
-internal class Appointment
+class Appointment
 {
     public string Subject { get; set; }
     public GraphEmailAddress Organizer { get; set; }
+    public AppointmentDateTime Start { get; set; }
+    public AppointmentDateTime End { get; set; }
 }
 
-internal class GraphEmailAddress
+class GraphEmailAddress
 {
-    public string EmailAddress { get; set; }
+    public string Email { get; set; }
 }
 
-internal class CapacityItem
+class AppointmentDateTime
+{
+    public DateTime DateTime { get; set; }
+}
+
+class Absence
 {
     public string TeamId { get; set; }
     public string IterationId { get; set; }
     public string TeamMemberEmail { get; set; }
-    public List<Activity> Activities { get; set; }
+    public DateTime StartDate { get; set; }
+    public DateTime EndDate { get; set; }
 }
 
-internal class Activity
+class AzureDevOpsCapacityResponse
 {
-    public string Name { get; set; }
-    public int CapacityPerDay { get; set; }
+    public List<SprintCapacity> Capacities { get; set; }
 }
 
-internal class AzureDevOpsIteration
+class SprintCapacity
 {
-    public AzureDevOpsIterationAttributes Attributes { get; set; }
+    public string TeamMemberEmail { get; set; }
+    public string Activity { get; set; }
+    public double CapacityPerDay { get; set; }
+    public DateTime StartDate { get; set; }
+    public DateTime EndDate { get; set; }
 }
 
-internal class AzureDevOpsIterationAttributes
+class AzureDevOpsIteration
+{
+    public List<AzureDevOpsRelation> Relations { get; set; }
+    public AzureDevOpsAttributes Attributes { get; set; }
+}
+
+class AzureDevOpsAttributes
 {
     public DateTime StartDate { get; set; }
     public DateTime FinishDate { get; set; }
+}
+
+class AzureDevOpsRelation
+{
+    public string Id { get; set; }
+    public string Rel { get; set; }
+    public string Url { get; set; }
 }
